@@ -241,7 +241,7 @@ class MyClient(discord.Client):
         await MyClient.log_and_print_helper(f"Bot starting in default SIMULATION MODE. Use !sim off to enable live trading.")
 
     async def on_message(self, message):
-        if message.author == self.user: return
+      #  if message.author == self.user: return
 
         if message.channel.id == LIVE_COMMAND_CHANNEL_ID and message.content.startswith('!'):
             await self.handle_command(message)

@@ -14,8 +14,8 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_USER_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 LIVE_PLAY_WEBHOOK = os.getenv("LIVE_PLAY_WEBHOOK")
-TEST_LOGGING_WEBHOOK = os.getenv("TEST_LOGGING_WEBHOOK")
-LIVE_LOGGING_WEBHOOK = os.getenv("LIVE_LOGGING_WEBHOOK")
+TEST_LOGGING_WEBHOOK = os.getenv("TEST_LOGGING_WEBHOOK") # For test-mode channels
+LIVE_LOGGING_WEBHOOK = os.getenv("LIVE_LOGGING_WEBHOOK") # For the bot's own logs
 LIVE_COMMAND_CHANNEL_ID = int(os.getenv("LIVE_COMMAND_CHANNEL_ID"))
 
 from config import *
@@ -28,7 +28,8 @@ from channels.ryan import RyanParser
 from channels.fifi import FifiParser
 from feedback_logger import feedback_logger
 
-# --- Initialize Clients and Managers ---
+# --- Global State & Initializations ---
+SIM_MODE = False # Global simulation switch, controllable by command
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 live_trader = RobinhoodTrader()
 sim_trader = SimulatedTrader()
@@ -75,12 +76,13 @@ def _blocking_handle_trade(loop, handler, message_meta, raw_msg):
 
             channel_id = trade_obj["channel_id"]
             config = CHANNELS_CONFIG[channel_id]
-            is_live_mode = config['mode'] == 'live'
+            is_channel_live = config['mode'] == 'live'
             
-            trader = live_trader if is_live_mode else sim_trader
-            play_webhook = LIVE_PLAY_WEBHOOK if is_live_mode else TEST_LOGGING_WEBHOOK
+            play_webhook = LIVE_PLAY_WEBHOOK if is_channel_live else TEST_LOGGING_WEBHOOK
+            use_real_trader = is_channel_live and not SIM_MODE
+            trader = live_trader if use_real_trader else sim_trader
             
-            log_sync(f"🕠 Handling trade for {handler.name}: {trade_obj} (Mode: {config['mode'].upper()})")
+            log_sync(f"🕠 Handling trade for {handler.name}: {trade_obj} (Channel Mode: {config['mode'].upper()}, Global Sim: {SIM_MODE})")
             
             active_position = position_manager.find_position(channel_id, trade_obj) or {}
             symbol = trade_obj.get("ticker") or active_position.get("symbol")
@@ -99,11 +101,21 @@ def _blocking_handle_trade(loop, handler, message_meta, raw_msg):
             size = trade_obj.get("size", "full")
             result_summary = "Action not executed."
 
-            # --- TRADING LOGIC ---
             if action == "buy":
                 try:
-                    # ... (Full buy logic here) ...
-                    result_summary = f"[SIMULATED] BUY action for {symbol}" # Placeholder
+                    if not isinstance(price, (int, float)) or price <= 0:
+                        result_summary = "❌ Aborted: Invalid price for a buy order."
+                    else:
+                        portfolio_value = trader.get_portfolio_value()
+                        allocation = MAX_PCT_PORTFOLIO * POSITION_SIZE_MULTIPLIERS.get(size, 1.0) * config["multiplier"]
+                        max_amount = min(allocation * portfolio_value, MAX_DOLLAR_AMOUNT)
+                        padded_price = price * (1 + BUY_PRICE_PADDING)
+                        contracts = max(MIN_TRADE_QUANTITY, int(max_amount / (padded_price * 100)))
+                        stop_price = round(price * (1 - config["initial_stop_loss"]), 2)
+                        trader.place_option_buy_order(symbol, strike, expiration, opt_type, contracts, padded_price)
+                        trader.place_option_stop_loss_order(symbol, strike, expiration, opt_type, contracts, stop_price)
+                        result_summary = f"Placed BUY: {contracts}x {symbol} {strike}{opt_type} @ {padded_price:.2f} with stop @ {stop_price}"
+                        position_manager.add_position(channel_id, trade_obj)
                 except Exception as e:
                     result_summary = f"❌ API Error on BUY: {e}"
 
@@ -112,15 +124,45 @@ def _blocking_handle_trade(loop, handler, message_meta, raw_msg):
                     result_summary = "❌ No tracked position found to act on."
                 else:
                     try:
-                        # ... (Full trim/exit logic here) ...
-                        result_summary = f"[SIMULATED] {action.upper()} action for {symbol}" # Placeholder
+                        if price == 'BE':
+                            price = active_position.get('purchase_price', 0.0)
+                            if not isinstance(price, (int, float)) or price <= 0:
+                                raise ValueError("Breakeven price is invalid or missing from memory.")
+                        pos_on_broker = trader.find_open_option_position(symbol, strike, expiration, opt_type)
+                        if not pos_on_broker or float(pos_on_broker.get('quantity', 0)) == 0:
+                            result_summary = f"Position {symbol} not on broker. Clearing from memory."
+                            position_manager.clear_position(channel_id, active_position['trade_id'])
+                        else:
+                            instrument_url = pos_on_broker.get('legs', [{}])[0].get('option')
+                            for order in trader.get_open_orders_for_contract(instrument_url):
+                                trader.cancel_option_order(order['id'])
+                            log_sync(f"✅ Canceled open orders for {symbol}.")
+                            qty = int(float(pos_on_broker['quantity']))
+                            if action == "trim":
+                                trim_qty = max(1, qty // 4)
+                                remaining = qty - trim_qty
+                                trader.place_option_market_sell_order(symbol, strike, expiration, opt_type, trim_qty)
+                                market_data = trader.get_option_market_data(symbol, expiration, strike, opt_type)
+                                latest_price = float(market_data[0][0]['mark_price'])
+                                trailing_stop_price = round(latest_price * (1 - config["trailing_stop_loss_pct"]), 2)
+                                breakeven_price = float(active_position.get("purchase_price", 0.0))
+                                new_stop_price = max(breakeven_price, trailing_stop_price)
+                                trader.place_option_stop_loss_order(symbol, strike, expiration, opt_type, remaining, new_stop_price)
+                                result_summary = f"Trimmed {trim_qty}, placed new stop on {remaining} @ {new_stop_price:.2f}"
+                            else: # Full Exit
+                                trader.place_option_market_sell_order(symbol, strike, expiration, opt_type, qty)
+                                position_manager.clear_position(channel_id, active_position['trade_id'])
+                                result_summary = f"Exited {qty} contracts of {symbol}."
                     except Exception as e:
                         result_summary = f"❌ API Error on {action.upper()}: {e}"
-
+            
             log_sync(f"Execution Summary: {result_summary}")
             
-            sim_tag = "" if is_live_mode else "[TEST-MODE] "
-            alert = {"username": "TradeBot", "embeds": [{ "title": f"{sim_tag}[{handler.name}] {action.upper()}", "fields": [{"name": "Original Message", "value": raw_msg[:1024]}, {"name": "Parsed Message", "value": f"```json\n{json.dumps(trade_obj, indent=2)}```"}, {"name": "Execution Summary", "value": f"```{result_summary}```"}], "timestamp": datetime.utcnow().isoformat()}]}
+            title_tag = "[LIVE]" if use_real_trader else "[SIMULATED]"
+            if not is_channel_live:
+                title_tag = "[TEST-MODE]"
+
+            alert = {"username": "TradeBot", "embeds": [{ "title": f"{title_tag} [{handler.name}] {action.upper()}", "fields": [{"name": "Original Message", "value": raw_msg[:1024]}, {"name": "Parsed Message", "value": f"```json\n{json.dumps(trade_obj, indent=2)}```"}, {"name": "Execution Summary", "value": f"```{result_summary}```"}], "timestamp": datetime.utcnow().isoformat()}]}
             asyncio.run_coroutine_threadsafe(MyClient.send_webhook_helper(play_webhook, alert), loop)
 
     except Exception as e:
@@ -148,19 +190,12 @@ class MyClient(discord.Client):
         print(msg)
         await MyClient.send_webhook_helper(MyClient.static_logger_webhook, {"content": msg, "username": "UnifiedBot Logger"})
 
-    def get_trader(self, is_live: bool):
-        return live_trader if is_live else sim_trader
-
     async def get_positions_string(self) -> str:
-        # Note: This command now shows positions for the LIVE account only.
         try:
             positions = await self.loop.run_in_executor(None, live_trader.get_open_option_positions)
             if not positions:
                 return "No open option positions."
-            holdings = [
-                f"• {p['chain_symbol']} {p['expiration_date']} {p['strike_price']}{p['type'].upper()[0]} x{int(float(p['quantity']))}"
-                for p in positions
-            ]
+            holdings = [f"• {p['chain_symbol']} {p['expiration_date']} {p['strike_price']}{p['type'].upper()[0]} x{int(float(p['quantity']))}" for p in positions]
             return "\n".join(holdings)
         except Exception as e:
             return f"Error retrieving holdings: {e}"
@@ -195,16 +230,29 @@ class MyClient(discord.Client):
             return
 
     async def handle_command(self, message: discord.Message):
+        global SIM_MODE
         parts = message.content.lower().split()
         command = parts[0]
         
-        if command == "!status":
+        if command == "!sim":
+            if len(parts) > 1 and parts[1] in ["on", "true"]:
+                SIM_MODE = True
+                await message.channel.send("✅ **Global Simulation Mode is now ON.** All channels will be simulated.")
+            elif len(parts) > 1 and parts[1] in ["off", "false"]:
+                SIM_MODE = False
+                await message.channel.send("🚨 **Global Simulation Mode is now OFF.** Bot will follow per-channel modes.")
+            else:
+                await message.channel.send("Usage: `!sim on` or `!sim off`")
+        
+        elif command == "!status":
+            sim_status = "ON" if SIM_MODE else "OFF"
             live_channels = [cfg['name'] for cfg in CHANNELS_CONFIG.values() if cfg['mode'] == 'live']
             test_channels = [cfg['name'] for cfg in CHANNELS_CONFIG.values() if cfg['mode'] == 'test']
             status_msg = (
                 f"**Bot Status: OPERATIONAL**\n"
-                f"**Live Channels:** `{'`, `'.join(live_channels) or 'None'}`\n"
-                f"**Test Channels:** `{'`, `'.join(test_channels) or 'None'}`"
+                f"**Global Simulation Mode:** `{sim_status}`\n"
+                f"**Live-Mode Channels:** `{'`, `'.join(live_channels) or 'None'}`\n"
+                f"**Test-Mode Channels:** `{'`, `'.join(test_channels) or 'None'}`"
             )
             await message.channel.send(status_msg)
         

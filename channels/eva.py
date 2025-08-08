@@ -2,68 +2,68 @@
 from datetime import datetime, timezone
 from .base_parser import BaseParser
 
-# --- Channel-specific Parser ---
-CHANNEL_ID = 1072556084662902846
-
 class EvaParser(BaseParser):
-    # The __init__ method now receives the config directly
     def __init__(self, openai_client, channel_id, config):
-        # It no longer needs to look it up itself
         super().__init__(openai_client, channel_id, config["name"])
 
     def build_prompt(self) -> str:
-        title, description = self._current_message_meta if isinstance(self._current_message_meta, tuple) else ("UNKNOWN", self._current_message_meta)
-  
+        title, description = self._current_message_meta
         return f"""
-You are a highly accurate assistant for parsing option trading messages from a trader named Eva. Each message is an embedded Discord alert with a title and description.
+You are a highly accurate data extraction assistant for option trading signals from a trader named Eva.
+Your ONLY job is to extract the specified fields and return a single JSON object based on a strict set of rules.
 
-Eva uses three message types:
-- **OPEN**: opening a new trade.
-- **CLOSE**: closing a trade — could be a partial close (trim) or full close (stop).
-- **UPDATE**: not a trading instruction. Ignore and return {{ "action": "null" }}.
+--- OUTPUT FORMAT RULES ---
+1.  All JSON keys MUST be lowercase and snake_case (e.g., "option_type").
+2.  `ticker`: The stock symbol (e.g., "SPX").
+3.  `strike`: The strike price (number).
+4.  `type`: The option type ("call" or "put"). 'C' is "call", 'P' is "put".
+5.  `price`: The execution price (number). If "BE", return the string "BE".
+6.  `expiration`: The expiration date in YYYY-MM-DD format.
+7.  `size`: The position size (e.g., "small", "lotto", "full"). Default to "full" ONLY if no other size is mentioned.
 
-You must:
-1. Return structured JSON representing the trading action if it's an "OPEN" or "CLOSE".
-2. For "UPDATE", return {{ "action": "null" }}.
-3. If the message is "CLOSE", classify it as:
-   - "trim" → if the message suggests a **partial take profit**.
-   - "stop" → if the message suggests a **full exit**.
-4. If you are unsure between trim and stop, default to "stop".
-5. Extract these fields from the description: ticker, strike, type, price, size.
-6. **Expiration**: If the expiration date is not mentioned, it is a 0DTE trade for today.
+--- ACTION RULES ---
+1.  If Title is "OPEN", the action is "buy".
+2.  For a "CLOSE" Title, the action depends on the Description:
+    * If it contains "all out", "fully", or "remaining", the action is "exit".
+    * If it contains "some", "scale out", or "partial", the action is "trim".
+    * If unsure, default to "exit".
+3.  If Title is "UPDATE", the action is "null".
 
---- RULES ---
-1. ENTRY: Represents a new trade. Must include Ticker, Strike, Option Type, and Entry Price.
-2. TRIM: Represents a partial take-profit. Must include a price.
-3. EXIT: Represents a full close of the position.
-4. **Breakeven (BE): If the message indicates an exit at "BE" or "breakeven", you MUST return "BE" as the value for the "price" field. Example: {{"action": "exit", "price": "BE"}}**
-5. COMMENT: Not a trade instruction. Return null.
+--- CRITICAL LOGIC RULES ---
+1.  **DO NOT ASSUME `type`:** "BTO" (Buy to Open) is NOT a valid type. If the message says "BTO" but does not explicitly mention "C", "P", "call", or "put", you MUST omit the `type` key.
+2.  **DO NOT GUESS:** If any field (like `strike` or `expiration`) is missing, you MUST omit that key from the final JSON.
+3.  **BE THOROUGH:** For CLOSE actions, you MUST extract the `ticker`, `strike`, and `type` if they are mentioned anywhere in the message.
 
-Return **only** a JSON object.
+--- EXAMPLES ---
+* Message: Title="OPEN", Description="BTO SPX 08/07/2025 6425 @ 0.57" -> Correct JSON: {{"action": "buy", "ticker": "SPX", "strike": 6425, "price": 0.57, "expiration": "2025-08-07"}}
+* Message: Title="CLOSE", Description="STC CRCL 08/15/2025 200C @ 1.94 (all out...)" -> Correct JSON: {{"action": "exit", "ticker": "CRCL", "strike": 200, "type": "call", "price": 1.94, "expiration": "2025-08-15"}}
+* Message: Title="CLOSE", Description="STC CRWV... (Good spot to scale out half...)" -> Correct JSON: {{"action": "trim", "ticker": "CRWV", ...}}
 
-Now classify the following embedded message:
+Return only the valid JSON object. Do not include explanations.
 
-Title: {title.strip()}
-Description: {description.strip()}
+--- MESSAGE TO PARSE ---
+Title: "{title.strip()}"
+Description: "{description.strip()}"
 """
 
     def _normalize_entry(self, entry: dict) -> dict:
-        title, _ = self._current_message_meta if isinstance(self._current_message_meta, tuple) else ("UNKNOWN", "")
-        title_upper = title.strip().upper()
-
-        # --- FIX: Normalize OPEN/CLOSE actions ---
-        if title_upper == "OPEN":
-            entry["action"] = "buy"
-        elif title_upper == "CLOSE":
-            # The prompt now directly asks for the action to be trim/stop,
-            # but this handles cases where it might return a classification instead.
-            entry["action"] = entry.get("classification", "stop")
-        # --- END FIX ---
+        # This function is now much simpler as the prompt is more direct.
+        
+        # --- CRITICAL: Stricter Type Handling ---
+        entry_type = str(entry.get("type", "")).upper()
+        if 'C' in entry_type or 'CALL' in entry_type:
+            entry["type"] = "call"
+        elif 'P' in entry_type or 'PUT' in entry_type:
+            entry["type"] = "put"
+        else:
+            # If the type is ambiguous or missing, remove the key.
+            if 'type' in entry:
+                del entry['type']
+        # --- END ---
 
         if entry.get("action") == "buy":
             entry.setdefault("size", "full")
             if not entry.get("expiration"):
                 entry["expiration"] = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-                print(f"[{self.name}] No expiration found, defaulting to 0DTE: {entry['expiration']}")
-
+        
         return entry

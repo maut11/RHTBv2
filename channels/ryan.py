@@ -29,7 +29,7 @@ Return `null` if the message is COMMENT or not a trade instruction.
 1. ENTRY: Represents a new trade. Must include Ticker, Strike, Option Type, and Entry Price.
 2. TRIM: Represents a partial take-profit. Must include a price.
 3. EXIT: Represents a full close of the position.
-4. **Breakeven (BE): If the message indicates an exit at "BE" or "breakeven", you MUST return "BE" as the value for the "price" field. Example: {{"action": "exit", "price": "BE"}}**
+4. If a message contains both a "buy" and a "stop" instruction, only parse the "buy" action.
 5. COMMENT: Not a trade instruction. Return null.
 
 Each message falls into one of these categories:

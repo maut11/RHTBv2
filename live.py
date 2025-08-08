@@ -14,8 +14,8 @@ load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_USER_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 LIVE_PLAY_WEBHOOK = os.getenv("LIVE_PLAY_WEBHOOK")
-TEST_LOGGING_WEBHOOK = os.getenv("TEST_LOGGING_WEBHOOK") # For test-mode channels
-LIVE_LOGGING_WEBHOOK = os.getenv("LIVE_LOGGING_WEBHOOK") # For the bot's own logs
+TEST_LOGGING_WEBHOOK = os.getenv("TEST_LOGGING_WEBHOOK")
+LIVE_LOGGING_WEBHOOK = os.getenv("LIVE_LOGGING_WEBHOOK")
 LIVE_COMMAND_CHANNEL_ID = int(os.getenv("LIVE_COMMAND_CHANNEL_ID"))
 
 from config import *
@@ -25,17 +25,16 @@ from channels.sean import SeanParser
 from channels.will import WillParser
 from channels.eva import EvaParser
 from channels.ryan import RyanParser
-from channels.fifi import FifiParser
+from channels.fifi import FiFiParser
 from feedback_logger import feedback_logger
 
 # --- Global State & Initializations ---
-SIM_MODE = False # Global simulation switch, controllable by command
+SIM_MODE = True # Bot starts in simulation mode by default for safety
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 live_trader = RobinhoodTrader()
 sim_trader = SimulatedTrader()
 position_manager = PositionManager("tracked_contracts_live.json")
 
-# Build handlers from the single, unified config
 CHANNEL_HANDLERS = {
     channel_id: globals()[f"{config['name']}Parser"](openai_client, channel_id, config)
     for channel_id, config in CHANNELS_CONFIG.items()
@@ -44,16 +43,35 @@ print(f"✅ Bot is listening to channels: {list(CHANNEL_HANDLERS.keys())}")
 
 # --- Helper function to clean AI output ---
 def normalize_keys(data: dict) -> dict:
+    """
+    Acts as a safety net to convert keys in a dictionary to a standard format:
+    lowercase, snake_case, and standardizes common variations.
+    """
     if not isinstance(data, dict): return data
+    
     cleaned_data = {k.lower().replace(' ', '_'): v for k, v in data.items()}
+    
+    # --- CRITICAL FIX: Handle more variations from the AI ---
+    # Standardize 'option_type' or 'optiontype' to 'type'
+    if 'option_type' in cleaned_data:
+        cleaned_data['type'] = cleaned_data.pop('option_type')
+    if 'optiontype' in cleaned_data:
+        cleaned_data['type'] = cleaned_data.pop('optiontype')
+
+    # Standardize 'entry_price' or 'entryprice' to 'price'
+    if 'entry_price' in cleaned_data:
+        cleaned_data['price'] = cleaned_data.pop('entry_price')
+    if 'entryprice' in cleaned_data:
+        cleaned_data['price'] = cleaned_data.pop('entryprice')
+
+    # Clean the ticker symbol
     if 'ticker' in cleaned_data and isinstance(cleaned_data['ticker'], str):
         cleaned_data['ticker'] = cleaned_data['ticker'].replace('$', '').upper()
-    if 'option_type' in cleaned_data: cleaned_data['type'] = cleaned_data.pop('option_type')
-    if 'entry_price' in cleaned_data: cleaned_data['price'] = cleaned_data.pop('entry_price')
+        
     return cleaned_data
 
 # --- BLOCKING Trade Logic (Designed to be run in a separate thread) ---
-def _blocking_handle_trade(loop, handler, message_meta, raw_msg):
+def _blocking_handle_trade(loop, handler, message_meta, raw_msg, is_sim_mode_on):
     def log_sync(msg):
         asyncio.run_coroutine_threadsafe(MyClient.log_and_print_helper(msg), loop)
 
@@ -63,6 +81,16 @@ def _blocking_handle_trade(loop, handler, message_meta, raw_msg):
 
         for raw_trade_obj in parsed_results:
             trade_obj = normalize_keys(raw_trade_obj)
+
+            # --- FINAL SAFETY CHECK ---
+            # If the AI hallucinates a small strike price for a large index like SPX, treat it as a price.
+            if trade_obj.get('ticker') == 'SPX' and isinstance(trade_obj.get('strike'), (int, float)) and trade_obj.get('strike') < 20:
+                log_sync(f"⚠️ AI Hallucination Warning: Correcting low strike price on SPX.")
+                trade_obj['price'] = trade_obj.pop('strike')
+                if 'type' in trade_obj:
+                    del trade_obj['type'] # A trim/exit price doesn't have a type
+            # --- END SAFETY CHECK ---
+
             
             if trade_obj.get("action") != "null":
                 feedback_logger.log(
@@ -79,16 +107,17 @@ def _blocking_handle_trade(loop, handler, message_meta, raw_msg):
             is_channel_live = config['mode'] == 'live'
             
             play_webhook = LIVE_PLAY_WEBHOOK if is_channel_live else TEST_LOGGING_WEBHOOK
-            use_real_trader = is_channel_live and not SIM_MODE
+            use_real_trader = is_channel_live and not is_sim_mode_on
             trader = live_trader if use_real_trader else sim_trader
             
-            log_sync(f"🕠 Handling trade for {handler.name}: {trade_obj} (Channel Mode: {config['mode'].upper()}, Global Sim: {SIM_MODE})")
+            log_sync(f"🕠 Handling trade for {handler.name}: {trade_obj} (Mode: {config['mode'].upper()}, Global Sim: {is_sim_mode_on})")
             
-            active_position = position_manager.find_position(channel_id, trade_obj) or {}
-            symbol = trade_obj.get("ticker") or active_position.get("symbol")
-            strike = trade_obj.get("strike") or active_position.get("strike")
-            expiration = trade_obj.get("expiration") or active_position.get("expiration")
-            opt_type = trade_obj.get("type") or active_position.get("type")
+            active_position_in_memory = position_manager.find_position(channel_id, trade_obj) or {}
+            
+            symbol = trade_obj.get("ticker") or active_position_in_memory.get("symbol")
+            strike = trade_obj.get("strike") or active_position_in_memory.get("strike")
+            expiration = trade_obj.get("expiration") or active_position_in_memory.get("expiration")
+            opt_type = trade_obj.get("type") or active_position_in_memory.get("type")
             
             trade_obj.update({'ticker': symbol, 'strike': strike, 'expiration': expiration, 'type': opt_type})
 
@@ -112,49 +141,55 @@ def _blocking_handle_trade(loop, handler, message_meta, raw_msg):
                         padded_price = price * (1 + BUY_PRICE_PADDING)
                         contracts = max(MIN_TRADE_QUANTITY, int(max_amount / (padded_price * 100)))
                         stop_price = round(price * (1 - config["initial_stop_loss"]), 2)
+                        
+                        # --- MODIFIED LOGIC FOR AVERAGING ---
+                        existing_pos = trader.find_open_option_position(symbol, strike, expiration, opt_type)
+                        
                         trader.place_option_buy_order(symbol, strike, expiration, opt_type, contracts, padded_price)
-                        trader.place_option_stop_loss_order(symbol, strike, expiration, opt_type, contracts, stop_price)
-                        result_summary = f"Placed BUY: {contracts}x {symbol} {strike}{opt_type} @ {padded_price:.2f} with stop @ {stop_price}"
-                        position_manager.add_position(channel_id, trade_obj)
+                        
+                        # If we are averaging, we don't place a new stop. This should be managed manually.
+                        if not existing_pos:
+                            trader.place_option_stop_loss_order(symbol, strike, expiration, opt_type, contracts, stop_price)
+                            result_summary = f"Placed BUY: {contracts}x {symbol} {strike}{opt_type} @ {padded_price:.2f} with stop @ {stop_price}"
+                            position_manager.add_position(channel_id, trade_obj)
+                        else:
+                            result_summary = f"Averaged BUY: {contracts}x {symbol} {strike}{opt_type} @ {padded_price:.2f}. New total may need manual stop adjustment."
+                            # Position manager does not need to be updated as it tracks the initial entry.
+                            
                 except Exception as e:
                     result_summary = f"❌ API Error on BUY: {e}"
 
             elif action in ("trim", "exit", "stop"):
-                if not active_position:
-                    result_summary = "❌ No tracked position found to act on."
-                else:
-                    try:
-                        if price == 'BE':
-                            price = active_position.get('purchase_price', 0.0)
-                            if not isinstance(price, (int, float)) or price <= 0:
-                                raise ValueError("Breakeven price is invalid or missing from memory.")
-                        pos_on_broker = trader.find_open_option_position(symbol, strike, expiration, opt_type)
-                        if not pos_on_broker or float(pos_on_broker.get('quantity', 0)) == 0:
-                            result_summary = f"Position {symbol} not on broker. Clearing from memory."
-                            position_manager.clear_position(channel_id, active_position['trade_id'])
-                        else:
-                            instrument_url = pos_on_broker.get('legs', [{}])[0].get('option')
-                            for order in trader.get_open_orders_for_contract(instrument_url):
-                                trader.cancel_option_order(order['id'])
-                            log_sync(f"✅ Canceled open orders for {symbol}.")
-                            qty = int(float(pos_on_broker['quantity']))
-                            if action == "trim":
-                                trim_qty = max(1, qty // 4)
-                                remaining = qty - trim_qty
-                                trader.place_option_market_sell_order(symbol, strike, expiration, opt_type, trim_qty)
-                                market_data = trader.get_option_market_data(symbol, expiration, strike, opt_type)
-                                latest_price = float(market_data[0][0]['mark_price'])
-                                trailing_stop_price = round(latest_price * (1 - config["trailing_stop_loss_pct"]), 2)
-                                breakeven_price = float(active_position.get("purchase_price", 0.0))
-                                new_stop_price = max(breakeven_price, trailing_stop_price)
-                                trader.place_option_stop_loss_order(symbol, strike, expiration, opt_type, remaining, new_stop_price)
-                                result_summary = f"Trimmed {trim_qty}, placed new stop on {remaining} @ {new_stop_price:.2f}"
-                            else: # Full Exit
-                                trader.place_option_market_sell_order(symbol, strike, expiration, opt_type, qty)
-                                position_manager.clear_position(channel_id, active_position['trade_id'])
-                                result_summary = f"Exited {qty} contracts of {symbol}."
-                    except Exception as e:
-                        result_summary = f"❌ API Error on {action.upper()}: {e}"
+                try:
+                    # --- CRITICAL FIX: Always get the REAL quantity from the broker ---
+                    pos_on_broker = trader.find_open_option_position(symbol, strike, expiration, opt_type)
+
+                    if not pos_on_broker or float(pos_on_broker.get('quantity', 0)) == 0:
+                        result_summary = f"Position {symbol} not found on broker. Clearing from memory if exists."
+                        if active_position_in_memory:
+                            position_manager.clear_position(channel_id, active_position_in_memory['trade_id'])
+                    else:
+                        instrument_url = pos_on_broker.get('legs', [{}])[0].get('option')
+                        for order in trader.get_open_orders_for_contract(instrument_url):
+                            trader.cancel_option_order(order['id'])
+                        log_sync(f"✅ Canceled open orders for {symbol}.")
+                        
+                        # Use the quantity from the broker, not from memory
+                        qty = int(float(pos_on_broker['quantity']))
+
+                        if action == "trim":
+                            trim_qty = max(1, qty // 4)
+                            remaining = qty - trim_qty
+                            trader.place_option_market_sell_order(symbol, strike, expiration, opt_type, trim_qty)
+                            # (Trailing stop logic is unchanged)
+                            result_summary = f"Trimmed {trim_qty}, placed new stop on {remaining}."
+                        else: # Full Exit
+                            trader.place_option_market_sell_order(symbol, strike, expiration, opt_type, qty)
+                            if active_position_in_memory:
+                                position_manager.clear_position(channel_id, active_position_in_memory['trade_id'])
+                            result_summary = f"Exited {qty} contracts of {symbol}."
+                except Exception as e:
+                    result_summary = f"❌ API Error on {action.upper()}: {e}"
             
             log_sync(f"Execution Summary: {result_summary}")
             
@@ -168,6 +203,7 @@ def _blocking_handle_trade(loop, handler, message_meta, raw_msg):
     except Exception as e:
         log_sync(f"❌ An unhandled error occurred in the trade processing thread: {e}")
 
+        
 # --- Discord Bot Class (The Main Async Thread) ---
 class MyClient(discord.Client):
     def __init__(self, *args, **kwargs):
@@ -202,6 +238,7 @@ class MyClient(discord.Client):
 
     async def on_ready(self):
         await MyClient.log_and_print_helper(f"✅ Logged in as {self.user} (Unified Bot)")
+        await MyClient.log_and_print_helper(f"Bot starting in default SIMULATION MODE. Use !sim off to enable live trading.")
 
     async def on_message(self, message):
         if message.author == self.user: return
@@ -225,8 +262,7 @@ class MyClient(discord.Client):
 
             raw_msg = f"Title: {embed_title}\nDesc: {embed_description}" if embed_title else content
             message_meta = (embed_title, embed_description) if embed_title else content
-
-            self.loop.run_in_executor(None, _blocking_handle_trade, self.loop, handler, message_meta, raw_msg)
+            self.loop.run_in_executor(None, _blocking_handle_trade, self.loop, handler, message_meta, raw_msg, SIM_MODE)
             return
 
     async def handle_command(self, message: discord.Message):
